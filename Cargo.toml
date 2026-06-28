@@ -5,6 +5,11 @@ edition = "2021"
 rust-version = "1.85"
 description = "A FASP-inspired reliable bulk file transfer over UDP for long fat networks."
 license = "MIT"
+repository = "https://github.com/flyingllama87/girth"
+homepage = "https://github.com/flyingllama87/girth"
+readme = "README.md"
+keywords = ["file-transfer", "udp", "networking", "lfn", "fasp"]
+categories = ["network-programming", "command-line-utilities"]
 
 [lib]
 name = "girth"

@@ -365,7 +365,10 @@ fn ingest_loop(sh: &Shared, stop: &Arc<AtomicBool>, mut br: BatchReceiver) {
                 }
                 continue;
             }
-            Err(_) => return,
+            Err(e) => {
+                eprintln!("girth [ingest-fatal] receive worker exiting: {e}");
+                return;
+            }
         };
         for i in 0..n {
             let (data, addr) = br.message_mut(i);

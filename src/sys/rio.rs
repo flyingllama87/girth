@@ -68,6 +68,12 @@ struct RioCore {
     _sock: Arc<UdpSocket>, // keep the socket (hence the RIO queues) alive
     rio: RIO_EXTENSION_FUNCTION_TABLE,
     cq: RIO_CQ,
+    // Separate completion queue for the feedback/NACK send path. Sends MUST NOT
+    // share the receive CQ: during a loss-driven NACK storm the send completions
+    // would pile into the receive CQ faster than the harvester drains them and
+    // overflow it (RIO_CORRUPT_CQ), killing the receiver. With its own CQ —
+    // drained inline by `send_to` — sends can never starve or corrupt receives.
+    send_cq: RIO_CQ,
     rq: RIO_RQ,
     event: HANDLE, // signaled by RIONotify when a completion lands
     data_bufid: RIO_BUFFERID,
@@ -188,15 +194,25 @@ impl RioCore {
         notify.Anonymous.Event.NotifyReset = 0; // RIO does not reset; auto-reset event does
 
         let create_cq = rio.RIOCreateCompletionQueue.unwrap();
-        // The CQ must hold every outstanding completion of every request queue
-        // bound to it: MaxOutstandingReceive (NSLOTS) + MaxOutstandingSend
-        // (SEND_RING). Size it with slack or RIOCreateRequestQueue / submits fail
-        // with WSAENOBUFS.
-        let cq_size = (NSLOTS + SEND_RING + 16) as u32;
+        // Receive CQ: event-notified, holds the receive completions only
+        // (MaxOutstandingReceive = NSLOTS, plus slack). Sends go to their own CQ
+        // below, so a NACK storm can no longer overflow this queue.
+        let cq_size = (NSLOTS + 16) as u32;
         let cq = unsafe { create_cq(cq_size, &notify) };
         if cq == 0 {
             return Err(io::Error::other(format!(
                 "RIOCreateCompletionQueue({cq_size}) failed: wsa={}",
+                unsafe { WSAGetLastError() }
+            )));
+        }
+        // Send CQ: pure-poll (NULL notification), drained inline by `send_to`.
+        // Sized well above SEND_RING so transient bursts never overflow before
+        // the next drain.
+        let send_cq_size = (SEND_RING * 4) as u32;
+        let send_cq = unsafe { create_cq(send_cq_size, ptr::null()) };
+        if send_cq == 0 {
+            return Err(io::Error::other(format!(
+                "RIOCreateCompletionQueue(send, {send_cq_size}) failed: wsa={}",
                 unsafe { WSAGetLastError() }
             )));
         }
@@ -208,8 +224,8 @@ impl RioCore {
                 1,
                 SEND_RING as u32,
                 1,
-                cq,
-                cq,
+                cq,      // receive completion queue
+                send_cq, // send completion queue (separate)
                 ptr::null(),
             )
         };
@@ -240,6 +256,7 @@ impl RioCore {
             _sock: sock,
             rio,
             cq,
+            send_cq,
             rq,
             event,
             data_bufid,
@@ -317,6 +334,20 @@ impl RioCore {
         let len = buf.len().min(self.buf_len);
         let send_ex = self.rio.RIOSendEx.unwrap();
         let mut guard = self.rq_mu.lock().unwrap();
+
+        // Reap completed sends from the dedicated send CQ before posting another.
+        // This keeps outstanding sends bounded (so the ring slot we are about to
+        // reuse is free) and keeps the send CQ from ever filling. Non-blocking;
+        // sends complete in microseconds.
+        let dequeue = self.rio.RIODequeueCompletion.unwrap();
+        let mut scratch: [RIORESULT; SEND_RING] = unsafe { mem::zeroed() };
+        loop {
+            let n = unsafe { dequeue(self.send_cq, scratch.as_mut_ptr(), SEND_RING as u32) };
+            if n == 0 || n == windows_sys::Win32::Networking::WinSock::RIO_CORRUPT_CQ {
+                break;
+            }
+        }
+
         let slot = *guard as usize;
         *guard = ((slot + 1) % SEND_RING) as u32;
 
@@ -413,6 +444,7 @@ impl Drop for RioCore {
         unsafe {
             if let Some(close_cq) = self.rio.RIOCloseCompletionQueue {
                 close_cq(self.cq);
+                close_cq(self.send_cq);
             }
             if let Some(dereg) = self.rio.RIODeregisterBuffer {
                 dereg(self.data_bufid);
@@ -495,10 +527,16 @@ impl BatchReceiver {
     /// notification as needed) and returns a `WouldBlock` error (treated as an
     /// idle timeout by the ingest loop) if nothing arrives.
     pub fn recv(&mut self, _sock: &UdpSocket) -> io::Result<usize> {
-        for &idx in &self.pending {
-            let _ = self.core.post_recv(idx as usize);
-        }
-        self.pending.clear();
+        // Re-post the previous harvest's slots. A re-post can fail transiently
+        // (e.g. WSAENOBUFS, 10055, under send/receive RQ pressure during a NACK
+        // storm); on failure we MUST keep the slot queued and retry next call,
+        // not drop it. Dropping leaks the slot from the fixed pool, and since
+        // slots are only ever re-posted from harvested completions, a leaked
+        // slot never returns — enough leaks and the pool empties, no completions
+        // ever land, and the receiver wedges permanently (OS keeps receiving
+        // datagrams it has no buffer for). `retain` keeps the ones that failed.
+        let core = &self.core;
+        self.pending.retain(|&idx| core.post_recv(idx as usize).is_err());
         self.batch.clear();
 
         let dequeue = self.core.rio.RIODequeueCompletion.unwrap();
