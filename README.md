@@ -1,4 +1,4 @@
-# girth
+# GIRTH
 
 girth is a Rust library and CLI for fast bulk file transfer over Long Fat Networks: high bandwidth, high round-trip time links where normal single-stream TCP leaves most of the pipe empty.
 
