@@ -2,6 +2,8 @@
 
 girth is a Rust library and CLI for fast bulk file transfer over Long Fat Networks: high bandwidth, high round-trip time links where normal single-stream TCP leaves most of the pipe empty.
 
+Tested up to 2500 Mbps+ on Windows & 1700 Mbps+ on Linux over LFNs (London <-> Sydney).
+
 It is inspired by Aspera FASP's core transport idea: use a reliable control channel for setup, move bulk data over paced UDP, and let the receiver drive loss recovery with NACKs. Reliability is separate from rate control, so a lost packet does not collapse the sender's congestion window the way it can with a single TCP flow. The packet pacer is delay based instead of the more common loss based pacers, allowing one to fill a LFN and recover from transient network speed drops.
 
 The project *was* AI-assisted (Opus 4.8 High reasoning). However, the project was tested and compared repeatedly to other solutions to ensure real performance over LFNs on both Linux and Windows.
@@ -15,8 +17,8 @@ The project *was* AI-assisted (Opus 4.8 High reasoning). However, the project wa
 - Optional data encryption: 256-bit AEAD key using X25519 + HKDF-SHA256; AES-256-GCM (if hardware supports) or ChaCha20-Poly1305 (fallback)
 - File-backed CLI plus in-memory `BlockSource` / `BlockSink` APIs
 - Linux has recvmmsg/sendmmsg batching backend 
-- Windows has a RIO receive/send backend
-- Original Go implementation is available on the `go` branch
+- Windows has a RIO (Registered Input-Output) receive/send backend
+- Original Go implementation is available on the `go` branch but is not wire compatible with the rust version, but the core transport and packet pacer is the same.
 
 ## Simple Example
 
