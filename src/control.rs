@@ -63,6 +63,12 @@ pub struct Hello {
     pub ciphers: Option<Vec<String>>,
     #[serde(default, with = "b64opt", skip_serializing_if = "Option::is_none")]
     pub pub_key: Option<Vec<u8>>,
+
+    /// PSK proof of possession: `HMAC-SHA256(token, transcript)` binding the
+    /// request fields and the client's ephemeral public key. Absent when
+    /// the client is not authenticating. The token itself is never sent.
+    #[serde(default, with = "b64opt", skip_serializing_if = "Option::is_none")]
+    pub auth_mac: Option<Vec<u8>>,
 }
 
 /// The server's reply.
@@ -84,6 +90,15 @@ pub struct Ack {
     pub cipher: String,
     #[serde(default, with = "b64opt", skip_serializing_if = "Option::is_none")]
     pub pub_key: Option<Vec<u8>>,
+
+    /// Set when the server requires a PSK and the client did not present a valid
+    /// proof, so the client can distinguish "auth needed" from other failures.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub auth_required: bool,
+    /// The server's reply MAC, authenticating the server and binding the session
+    /// id and the server's ephemeral public key.
+    #[serde(default, with = "b64opt", skip_serializing_if = "Option::is_none")]
+    pub auth_mac: Option<Vec<u8>>,
 }
 
 /// Writes a length-prefixed JSON value to the control connection.

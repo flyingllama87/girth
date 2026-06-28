@@ -264,6 +264,7 @@ dependencies = [
  "crc32c",
  "crossbeam-channel",
  "hkdf",
+ "hmac",
  "libc",
  "rand_core",
  "serde",

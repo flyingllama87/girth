@@ -30,6 +30,9 @@ base64 = "0.22"
 # Data-plane crypto. RustCrypto AEADs use AES-NI / SIMD where available.
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 hkdf = "0.12"
+# Control-plane PSK auth: HMAC-SHA256 over the handshake transcript, binding the
+# token to the ephemeral DH keys (src/auth.rs).
+hmac = "0.12"
 sha2 = "0.10"
 aes-gcm = "0.10"
 chacha20poly1305 = "0.10"

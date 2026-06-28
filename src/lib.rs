@@ -12,8 +12,12 @@
 //! rate. The sender is "dumb": it paces injection at the target rate, services
 //! retransmissions before new data, and echoes timing ticks.
 
+pub mod auth;
 pub mod control;
 pub mod crypto;
+pub mod error;
+pub mod io;
+pub mod log;
 pub mod losstracker;
 pub mod protocol;
 pub mod rate;
@@ -25,6 +29,10 @@ pub mod transfer;
 pub mod util;
 
 pub use control::{default_params, TransferParams, MODE_RECV, MODE_SEND};
+pub use error::GirthError;
+pub use io::{source_crc32c, BlockSink, BlockSource, FileSink, FileSource, MemSink, MemSource};
 pub use protocol::{DEFAULT_BLOCK_SIZE, PROTOCOL_VERSION};
 pub use stats::Stats;
-pub use transfer::{client_recv, client_send, Server};
+pub use transfer::{
+    client_recv, client_recv_into, client_send, client_send_from, AuthContext, Authorizer, Server,
+};

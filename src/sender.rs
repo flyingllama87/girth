@@ -9,6 +9,7 @@
 //!   - the calling thread runs the high-precision pacing loop.
 
 use crate::crypto::AeadBox;
+use crate::io::BlockSource;
 use crate::protocol::*;
 use crate::rate::{RateConfig, RateMode};
 use crate::stats::Stats;
@@ -17,7 +18,6 @@ use crate::util::precise_sleep_us;
 use crossbeam_channel::{bounded, Receiver, Sender as ChanSender, TryRecvError};
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashSet};
-use std::fs::File;
 use std::io;
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -30,7 +30,7 @@ pub struct SendConfig {
     pub sock: Arc<UdpSocket>,
     /// Receiver UDP addr; `None` => learned from the first packet (START).
     pub peer: Option<SocketAddr>,
-    pub file: Arc<File>,
+    pub source: Arc<dyn BlockSource>,
     pub file_size: i64,
     pub block_size: usize,
     pub total_blocks: u64,
@@ -57,7 +57,7 @@ struct TickState {
 
 struct Shared {
     sock: Arc<UdpSocket>,
-    file: Arc<File>,
+    source: Arc<dyn BlockSource>,
     file_size: i64,
     block_size: usize,
     total_blocks: u64,
@@ -119,7 +119,7 @@ impl Sender {
         let init = self.cfg.stats.target_rate_bps.load(Ordering::Relaxed);
         let shared = Arc::new(Shared {
             sock: self.cfg.sock.clone(),
-            file: self.cfg.file.clone(),
+            source: self.cfg.source.clone(),
             file_size: self.cfg.file_size,
             block_size: self.cfg.block_size,
             total_blocks: self.cfg.total_blocks,
@@ -224,12 +224,10 @@ fn prefetch(
         if rem < plen as i64 {
             plen = rem as usize;
         }
-        if sys::read_exact_at(
-            &sh.file,
-            &mut buf[DATA_HEADER_SIZE..DATA_HEADER_SIZE + plen],
-            off,
-        )
-        .is_err()
+        if sh
+            .source
+            .read_exact_at(off, &mut buf[DATA_HEADER_SIZE..DATA_HEADER_SIZE + plen])
+            .is_err()
         {
             return;
         }
@@ -432,12 +430,9 @@ fn fill_retransmit(sh: &Shared, buf: &mut [u8], seq: u64) -> Option<usize> {
     if plen == 0 || (rem <= 0) {
         return None;
     }
-    sys::read_exact_at(
-        &sh.file,
-        &mut buf[DATA_HEADER_SIZE..DATA_HEADER_SIZE + plen],
-        off,
-    )
-    .ok()?;
+    sh.source
+        .read_exact_at(off, &mut buf[DATA_HEADER_SIZE..DATA_HEADER_SIZE + plen])
+        .ok()?;
     let mut flags = FLAG_RETRANSMIT;
     if seq == sh.total_blocks - 1 {
         flags |= FLAG_LAST_BLOCK;

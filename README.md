@@ -4,10 +4,11 @@ girth is a Rust library and CLI for fast bulk file transfer over Long Fat
 Networks: high bandwidth, high round-trip time links where normal single-stream
 TCP leaves most of the pipe empty.
 
-It uses a TCP control channel for setup and a paced UDP data plane for file data.
-Reliability is receiver-driven with NACKs, so loss recovery is separate from rate
-control. The current Rust implementation is the primary public implementation.
-The original Go implementation is kept on the `go` branch.
+It is inspired by Aspera FASP's core transport idea: use a reliable control
+channel for setup, move bulk data over paced UDP, and let the receiver drive
+loss recovery with NACKs. Reliability is separate from rate control, so a lost
+packet does not collapse the sender's congestion window the way it can with a
+single TCP flow.
 
 The project was AI-assisted with Opus 4.8 High reasoning. The code was not judged
 by vibes: it was validated with loopback tests, Rust/Go wire-compatibility tests,
@@ -18,29 +19,67 @@ and real performance runs over LFNs.
 - Library crate: `girth`
 - CLI binary: `girth`
 - Runtime model: blocking OS threads, no async runtime
-- Data plane: UDP DATA/FEEDBACK/START/FIN PDUs
 - Control plane: length-prefixed JSON over TCP
+- Data plane: UDP DATA/FEEDBACK/START/FIN PDUs
 - Optional data encryption: X25519 + HKDF + AES-256-GCM or ChaCha20-Poly1305
-- Tested on Linux; Windows has a RIO receive/send backend on the Rust branch
-- Go wire-compatible implementation available on the `go` branch
+- File-backed CLI plus in-memory `BlockSource` / `BlockSink` APIs
+- Tested on Linux; Windows has a RIO receive/send backend
+- Original Go implementation is available on the `go` branch
 
-## Why
+## Simple Example
 
-On a long path, throughput is bounded by bytes in flight divided by RTT. A
-single TCP flow with default socket buffers can get stuck far below the link
-capacity, and loss can collapse its congestion window.
+Build the CLI:
 
-girth takes the FASP-style approach:
+```sh
+cargo build --release
+```
 
-- Send file data over UDP at a paced target rate.
-- Let the receiver track missing blocks and request retransmission.
-- Keep rate control separate from reliability.
-- Write received blocks to disk in order, so retransmits do not turn the disk
-  path into random I/O.
+On the machine that will receive or serve files:
 
-This is meant for big files across long links, not tiny RPCs or directory sync.
+```sh
+target/release/girth server -addr :7400 -dir /data
+```
 
-## Build
+Push a file to it:
+
+```sh
+target/release/girth send -rate 800 ./bigfile.bin server.example:7400
+```
+
+Pull a file from it:
+
+```sh
+target/release/girth recv -rate 800 server.example:7400 bigfile.bin ./bigfile.bin
+```
+
+Add `-encrypt` on client commands if you want encrypted DATA payloads.
+
+## Network Requirements
+
+girth uses two network paths:
+
+| Channel | Protocol | Direction | Purpose |
+|---|---|---|---|
+| Control | TCP | client to server | handshake, file metadata, negotiated UDP port, optional key exchange |
+| Data | UDP | bidirectional | file DATA, receiver START, FEEDBACK/NACKs, FIN |
+
+The server always needs an inbound TCP control port. The default CLI port is
+`7400`, set with `girth server -addr :7400`.
+
+For each transfer, the receiver binds a UDP data socket and advertises that port
+over the TCP control channel. With the CLI/server defaults this is an ephemeral
+UDP port. That is fine on open hosts, but firewalls need to allow the UDP data
+port as well as the TCP control port.
+
+For library servers, use `Server::with_udp_port_range(start..=end)` to constrain
+the UDP data ports to a firewall-friendly range. Open inbound TCP on the control
+port and inbound UDP on that range.
+
+Pull mode is NAT-friendly for a receiver behind NAT/CGNAT: the receiver dials the
+server's TCP control port and sends the first UDP START packet out to the server,
+creating the NAT mapping before data starts flowing.
+
+## Build And Test
 
 ```sh
 cargo build --release
@@ -49,27 +88,7 @@ cargo clippy --all-targets
 cargo fmt --check
 ```
 
-The CLI ends up at `target/release/girth`.
-
 ## CLI
-
-Run a server:
-
-```sh
-girth server -addr :7400 -dir /data
-```
-
-Push a file to the server:
-
-```sh
-girth send -rate 800 bigfile.bin server.example:7400
-```
-
-Pull a file from the server:
-
-```sh
-girth recv -rate 800 server.example:7400 bigfile.bin ./bigfile.bin
-```
 
 Common flags:
 
@@ -90,10 +109,12 @@ oscillate.
 
 ## Library Use
 
+File-backed transfer:
+
 ```rust
-use girth::{client_recv, client_send, default_params, Server};
-use std::sync::Arc;
+use girth::{client_recv, client_send, default_params};
 use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 
 let stop = Arc::new(AtomicBool::new(false));
 
@@ -104,7 +125,33 @@ params.encrypt = true;
 client_send("server.example:7400", "bigfile.bin", &params, stop.clone())?;
 client_recv("server.example:7400", "bigfile.bin", "./out.bin", &params, stop)?;
 
-# Ok::<(), std::io::Error>(())
+# Ok::<(), girth::GirthError>(())
+```
+
+In-memory transfer APIs are also available for applications that already have
+bytes in memory and do not want to stage through temporary files:
+
+```rust
+use girth::{client_send_from, default_params, MemSource, Stats};
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
+
+let source = Arc::new(MemSource::new(b"payload".to_vec()));
+let stats = Some(Stats::new());
+let stop = Arc::new(AtomicBool::new(false));
+let params = default_params();
+
+client_send_from(
+    "server.example:7400",
+    source,
+    "object.bin",
+    &params,
+    stats,
+    None,
+    stop,
+)?;
+
+# Ok::<(), girth::GirthError>(())
 ```
 
 As a Git dependency:
@@ -161,20 +208,13 @@ girth requests large socket buffers, but the OS caps those requests. If the caps
 are tiny, the transfer still works, but the kernel will drop bursts that girth
 then has to retransmit.
 
-## Public Branches
-
-- `main`: Rust implementation, primary public code.
-- `go`: original Go implementation.
-- `lore-embedding`: Rust branch with embedding-oriented APIs for Lore, including
-  in-memory sources/sinks and control-plane auth work.
-
 ## Current Gaps
 
-- Pick and document a stable public API policy before publishing a crate.
 - Add CI for Linux Rust tests, clippy, and format checks.
 - Add release artifacts or install instructions if users should fetch binaries
   rather than build from source.
 - Add multi-file transfer or directory packing if that becomes a goal.
+- Publish a crate once the public API is stable enough to support semver.
 
 ## License
 

@@ -1,4 +1,9 @@
-//! Command `girth`: a CLI client/server for the girth bulk transfer protocol.
+//! Command `girth`: a CLI client/server for the girth bulk transfer protocol —
+//! a FASP-inspired reliable UDP file transfer for long fat networks.
+//!
+//!   girth server [flags]                          run a server
+//!   girth send   [flags] <file> <host:port>       push a file to a server
+//!   girth recv   [flags] <host:port> <name> <out> pull a file from a server
 
 use girth::{client_recv, client_send, default_params, Server, TransferParams, DEFAULT_BLOCK_SIZE};
 use std::process::exit;
@@ -6,7 +11,7 @@ use std::time::Duration;
 
 fn usage() {
     eprint!(
-        "girth - FASP-inspired LFN file transfer (Rust)
+        "girth — FASP-inspired LFN file transfer (Rust)
 
 commands:
   girth server [flags]                          run a server
@@ -30,6 +35,8 @@ flags:
     );
 }
 
+/// A tiny flag parser: supports `-flag value`, `-flag=value`, and bare bool
+/// flags. Returns (params, addr, dir, positionals).
 struct Parsed {
     params: TransferParams,
     addr: String,
@@ -55,6 +62,7 @@ fn parse(args: &[String]) -> Result<Parsed, String> {
                 Some((n, v)) => (n, Some(v.to_string())),
                 None => (flag, None),
             };
+            // Boolean flags take no value.
             let is_bool = matches!(name, "adaptive" | "encrypt");
             let value = if is_bool {
                 None
@@ -86,7 +94,7 @@ fn parse(args: &[String]) -> Result<Parsed, String> {
                 "report" => report_ms = num()? as i64,
                 "addr" => addr = value.unwrap(),
                 "dir" => dir = value.unwrap(),
-                "procs" => {}
+                "procs" => { /* accepted for CLI parity; Rust uses all cores */ }
                 "h" | "help" => {
                     usage();
                     exit(0);
@@ -137,15 +145,13 @@ fn main() {
             exit(2);
         }
     };
+    // Route girth's status output to stderr (the library is silent by default).
+    girth::log::init_stderr_logger();
     let stop = girth::sys::install_termination_handler();
 
     let result = match cmd {
         "server" => {
-            let srv = Server {
-                addr: parsed.addr.clone(),
-                dir: parsed.dir.clone(),
-                params: parsed.params,
-            };
+            let srv = Server::new(parsed.addr.clone(), parsed.dir.clone(), parsed.params);
             srv.listen_and_serve(stop)
                 .map_err(|e| format!("server error: {}", e))
         }

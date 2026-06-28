@@ -7,6 +7,7 @@
 //! on-disk pattern stays sequential regardless of arrival order.
 
 use crate::crypto::AeadBox;
+use crate::io::BlockSink;
 use crate::losstracker::{LossScanner, RecvBitmap};
 use crate::protocol::*;
 use crate::rate::{RateConfig, RateController, RttEstimator};
@@ -15,7 +16,6 @@ use crate::sys::{self, BatchReceiver};
 use crate::util::num_cpu;
 use crossbeam_channel::{bounded, Receiver, Sender as ChanSender};
 use std::collections::HashMap;
-use std::fs::File;
 use std::io;
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 
 pub struct RecvConfig {
     pub sock: Arc<UdpSocket>,
-    pub file: Arc<File>,
+    pub sink: Arc<dyn BlockSink>,
     pub file_size: i64,
     pub block_size: usize,
     pub total_blocks: u64,
@@ -52,7 +52,7 @@ struct RttState {
 
 struct Shared {
     sock: Arc<UdpSocket>,
-    file: Arc<File>,
+    sink: Arc<dyn BlockSink>,
     file_size: i64,
     block_size: usize,
     total_blocks: u64,
@@ -138,7 +138,7 @@ pub fn new_receiver(mut cfg: RecvConfig) -> Receiver_ {
 
     let sh = Arc::new(Shared {
         sock: cfg.sock,
-        file: cfg.file,
+        sink: cfg.sink,
         file_size: cfg.file_size,
         block_size: cfg.block_size,
         total_blocks: cfg.total_blocks,
@@ -300,8 +300,8 @@ fn flusher_loop(sh: &Shared, stop: &Arc<AtomicBool>) {
             let seq = write_front;
             let staged = sh.stage.lock().unwrap().remove(&seq);
             if let Some(buf) = staged {
-                if let Err(e) = sys::write_all_at(&sh.file, &buf, seq * bs) {
-                    eprintln!("girth-recv: write error at block {}: {}", seq, e);
+                if let Err(e) = sh.sink.write_all_at(seq * bs, &buf) {
+                    crate::log::error(&format!("recv: write error at block {}: {}", seq, e));
                 }
                 let _ = sh.free_tx.send(buf);
             }
@@ -340,7 +340,7 @@ fn writeback_loop(sh: &Shared, stop: &Arc<AtomicBool>) {
             hi_w = sh.file_size;
         }
         if hi_w > prefix {
-            sys::sync_file_range_write(&sh.file, prefix, hi_w - prefix);
+            sh.sink.sync_range(prefix, hi_w - prefix);
         }
         let c = sh.stats.hi_contig.load(Ordering::Relaxed) as i64 * bs;
         if c > prefix {
@@ -467,8 +467,8 @@ fn handle_packet(sh: &Shared, pkt: &mut [u8]) {
             // Stage pool exhausted: write directly (possible backward seek,
             // bounded to the overflow case).
             let off = seq * sh.block_size as u64;
-            if let Err(e) = sys::write_all_at(&sh.file, payload, off) {
-                eprintln!("girth-recv: write error at block {}: {}", seq, e);
+            if let Err(e) = sh.sink.write_all_at(off, payload) {
+                crate::log::error(&format!("recv: write error at block {}: {}", seq, e));
                 return;
             }
             sh.ready_bm.set_and_test(seq);

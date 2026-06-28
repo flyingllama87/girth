@@ -31,11 +31,7 @@ fn start_test_server(dir: &Path, p: TransferParams) -> TestServer {
     drop(ln);
 
     let stop = Arc::new(AtomicBool::new(false));
-    let srv = Server {
-        addr: addr.clone(),
-        dir: dir.to_string_lossy().into_owned(),
-        params: p,
-    };
+    let srv = Server::new(addr.clone(), dir.to_string_lossy().into_owned(), p);
     let st = stop.clone();
     let handle = std::thread::spawn(move || {
         let _ = srv.listen_and_serve(st);

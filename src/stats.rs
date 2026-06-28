@@ -2,7 +2,6 @@
 //! the periodic reporter. The hot path only does cheap atomic adds; gauges
 //! (rates, RTTs) are written by a single owner thread and read by the reporter.
 
-use std::io::Write;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -154,7 +153,7 @@ impl Stats {
                 dt = interval.as_secs_f64();
             }
             let line = self.format_line(role, dt, &prev, &cur);
-            let _ = writeln!(std::io::stderr(), "{}", line);
+            crate::log::info(&line);
             prev = cur;
             last = Instant::now();
         }

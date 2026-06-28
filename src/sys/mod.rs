@@ -241,6 +241,12 @@ fn arm_signals() {
 
 /// Installs SIGINT/SIGTERM (Ctrl-C on Windows) handlers and returns a flag that
 /// flips to `true` on first signal, for cooperative shutdown.
+///
+/// **CLI-only.** A library must never install process-global signal handlers
+/// implicitly (it would hijack an embedding host's signal handling), so no
+/// transfer entry point calls this — embedders drive shutdown via the
+/// caller-provided `Arc<AtomicBool>` they pass to the transfer functions. Only
+/// `bin/girth` invokes it.
 pub fn install_termination_handler() -> Arc<AtomicBool> {
     arm_signals();
     let stop = Arc::new(AtomicBool::new(false));

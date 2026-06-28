@@ -178,3 +178,49 @@ fn num_blocks_cases() {
         assert_eq!(num_blocks(size, bs), blocks, "num_blocks({size},{bs})");
     }
 }
+
+// --- decoder negative tests (no panics on malformed/short input) -------------
+
+#[test]
+fn decoders_reject_malformed_without_panicking() {
+    // Empty / truncated buffers of every length below the header size.
+    for n in 0..DATA_HEADER_SIZE {
+        assert!(decode_data_header(&vec![PDU_DATA; n]).is_none());
+    }
+    for n in 0..FEEDBACK_HEADER_SIZE {
+        assert!(decode_feedback(&vec![PDU_FEEDBACK; n]).is_none());
+    }
+
+    // Right length but wrong type byte.
+    assert!(decode_data_header(&[0xFE; DATA_HEADER_SIZE]).is_none());
+    assert!(decode_feedback(&[0xFE; FEEDBACK_HEADER_SIZE]).is_none());
+
+    // Feedback header claiming more NACK entries than the buffer can hold must
+    // be rejected rather than reading out of bounds.
+    let mut fb = vec![0u8; FEEDBACK_HEADER_SIZE];
+    fb[0] = PDU_FEEDBACK;
+    fb[2] = 0xFF; // nack_count low byte = 255, far more than present
+    fb[3] = 0xFF;
+    assert!(decode_feedback(&fb).is_none());
+
+    // pdu_type on an empty slice is well-defined (0), not a panic.
+    assert_eq!(pdu_type(&[]), 0);
+}
+
+#[test]
+fn decoders_accept_well_formed_after_negatives() {
+    // Sanity: a valid header still decodes (guards against an over-strict fix).
+    let mut buf = vec![0u8; DATA_HEADER_SIZE];
+    encode_data_header(
+        &mut buf,
+        &DataHeader {
+            payload_len: 0,
+            session: 7,
+            block_seq: 3,
+            ..Default::default()
+        },
+    );
+    let h = decode_data_header(&buf).expect("valid header decodes");
+    assert_eq!(h.session, 7);
+    assert_eq!(h.block_seq, 3);
+}
