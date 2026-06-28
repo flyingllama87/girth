@@ -12,9 +12,7 @@ The project *was* AI-assisted (Opus 4.8 High reasoning). However, the project wa
 - CLI binary: `girth`
 - Runtime model: blocking OS threads, no async runtime
 - Designed to spread load over multiple cores
-- Control plane: length-prefixed JSON over TCP
-- Data plane: UDP DATA/FEEDBACK/START/FIN PDUs
-- Optional data encryption: X25519 + HKDF + AES-256-GCM or ChaCha20-Poly1305
+- Optional data encryption: 256-bit AEAD key using X25519 + HKDF-SHA256; AES-256-GCM (if hardware supports) or ChaCha20-Poly1305 (fallback)
 - File-backed CLI plus in-memory `BlockSource` / `BlockSink` APIs
 - Linux has recvmmsg/sendmmsg batching backend 
 - Windows has a RIO receive/send backend
@@ -146,21 +144,21 @@ girth = { git = "https://github.com/flyingllama87/girth" }
 
 ## Benchmarks
 
-The main benchmark path was Sydney to London over public cloud (Digital Ocean) VMs using the public paths (i.e. internet), about 264 ms RTT, using a 2 GB file with end-to-end integrity checks. Socket buffers were raised to 128 MiB on the hosts for the high-BDP tests. iPerf put the link at 1.7 Gbps.
+The main benchmark path was Sydney to London over public cloud (Digital Ocean) VMs using the public paths (i.e. internet), about 264 ms RTT, using a 2 GB file with end-to-end integrity checks. Socket buffers were raised to 128 MiB on the hosts for the high-BDP tests. iPerf put the link max at 1.8 Gbps.
 
 | Tool / mode | Goodput | Notes |
 |---|---:|---|
-| girth, Rust main | 1816 Mbps | fastest run in the benchmark set |
-| FASP fixed-rate | 1726 Mbps | very fast, sender near one core |
+| girth (Rust) | 1816 Mbps | fastest run in the benchmark set |
+| FASP fixed-rate | 1726 Mbps | very fast, single threaded |
 | multi-tcp BBR x16 | 1451 Mbps | parallel TCP |
-| lfn-send | ~1200 Mbps | older loss-based UDP/TCP tool |
+| lfn-send | ~1200 Mbps | older loss-based UDP+TCP tool |
 | QUIC/BBR | 1052 Mbps | CPU-bound in userspace |
 | UDT tuned | ~1010 Mbps | one core at peaks |
 | bbcp x8 | ~784 Mbps | parallel TCP |
 | GridFTP | ~758 Mbps | server one-core bound |
 | HPN-SSH | 707 Mbps | single TCP stream with tuned buffers |
 
-Windows RIO testing on a Sydney to Windows path, about 259 ms RTT, moved a 1 GiB file at 1753.5 Mbps cleartext with 0 loss.
+Windows RIO testing on a London to Sydney path, about 263 ms RTT, moved a 2 GiB file at 1950 Mbps cleartext with 0 loss (Target: 2000 Mbps fixed rate).
 
 All quoted file-transfer results were verified with whole-file integrity checks.
 
