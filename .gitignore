@@ -1,12 +1,11 @@
+/bin/
 /target/
-**/*.rs.bk
-
+*.test
+*.out
+*.exe
 *.bin
 *.log
-*.out
 *.tmp
-*.test
-*.exe
 
 .DS_Store
 *.swp
