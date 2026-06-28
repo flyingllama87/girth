@@ -1,0 +1,16 @@
+/target/
+**/*.rs.bk
+
+*.bin
+*.log
+*.out
+*.tmp
+*.test
+*.exe
+
+.DS_Store
+*.swp
+*.swo
+*~
+.idea/
+.vscode/

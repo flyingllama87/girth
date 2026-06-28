@@ -1,0 +1,68 @@
+[package]
+name = "girth"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "A FASP-inspired reliable bulk file transfer over UDP for long fat networks."
+license = "MIT"
+
+[lib]
+name = "girth"
+path = "src/lib.rs"
+
+[[bin]]
+name = "girth"
+path = "src/bin/girth.rs"
+
+[dependencies]
+# Raw batched syscalls (sendmmsg/recvmmsg, fallocate, sync_file_range) and
+# socket option control on Linux. No async runtime: one OS thread per
+# data-plane role, mirroring the Go goroutine layout with zero runtime/GC
+# overhead. Off Linux a per-packet std fallback is used (see src/sys/).
+socket2 = { version = "0.5", features = ["all"] }
+crossbeam-channel = "0.5"
+
+# Control-plane JSON handshake (wire-compatible with the Go implementation).
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+
+# Data-plane crypto. RustCrypto AEADs use AES-NI / SIMD where available.
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+hkdf = "0.12"
+sha2 = "0.10"
+aes-gcm = "0.10"
+chacha20poly1305 = "0.10"
+aead = "0.5"
+rand_core = { version = "0.6", features = ["getrandom"] }
+
+# Hardware-accelerated CRC32C (SSE4.2 / ARMv8 CRC), matching Go's Castagnoli table.
+crc32c = "0.6"
+
+# Unix-only: raw libc syscalls for the Linux batched data-plane backend
+# (src/sys/linux.rs) and POSIX signal handling. Not linked on Windows, which
+# uses the portable backend (src/sys/portable.rs) and a kernel32 Ctrl handler.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+# Windows-only: RIO receive/send engine (src/sys/rio.rs), the Windows analogue
+# of recvmmsg for this data plane. The receiver keeps thousands of buffers
+# posted and sends feedback through RIOSendEx because a RIO socket cannot use
+# the standard recv_from/send_to path.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Networking_WinSock",
+    "Win32_Security",
+    "Win32_System_IO",
+    "Win32_System_Threading",
+] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
