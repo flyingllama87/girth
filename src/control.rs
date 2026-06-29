@@ -18,6 +18,10 @@ fn is_false(b: &bool) -> bool {
     !*b
 }
 
+fn is_zero_u64(v: &u64) -> bool {
+    *v == 0
+}
+
 /// base64 (standard, padded) serialization for optional byte fields, matching
 /// Go's `encoding/json` `[]byte` handling.
 mod b64opt {
@@ -56,6 +60,12 @@ pub struct Hello {
     pub adaptive: bool,
     pub alpha_bps: u64,
     pub crc32c: u32,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub warm_rate_bps: u64,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub warm_srtt_net_us: u64,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub warm_base_rtt_us: u64,
 
     #[serde(default, skip_serializing_if = "is_false")]
     pub encrypt: bool,

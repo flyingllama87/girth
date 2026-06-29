@@ -1,6 +1,5 @@
-//! girth — a FASP-inspired reliable bulk transfer over UDP for long fat
-//! networks (high bandwidth-delay product). Rust port of the Go implementation,
-//! wire-compatible with it (same JSON control handshake and binary PDU layout).
+//! girth - a FASP-inspired reliable bulk transfer over UDP for long fat
+//! networks (high bandwidth-delay product).
 //!
 //! Two planes:
 //!   - Control plane (TCP): session setup, file metadata, checksum + key exchange.
@@ -22,6 +21,7 @@ pub mod losstracker;
 pub mod protocol;
 pub mod rate;
 pub mod receiver;
+pub mod runtime;
 pub mod sender;
 pub mod stats;
 pub mod sys;
@@ -32,7 +32,11 @@ pub use control::{default_params, TransferParams, MODE_RECV, MODE_SEND};
 pub use error::GirthError;
 pub use io::{source_crc32c, BlockSink, BlockSource, FileSink, FileSource, MemSink, MemSource};
 pub use protocol::{DEFAULT_BLOCK_SIZE, PROTOCOL_VERSION};
-pub use stats::Stats;
+pub use rate::RateWarmStart;
+pub use runtime::{TransferControl, TransferHandle, TransferPhase};
+pub use stats::{Stats, StatsSnapshot};
 pub use transfer::{
-    client_recv, client_recv_into, client_send, client_send_from, AuthContext, Authorizer, Server,
+    client_recv, client_recv_into, client_recv_into_with_handle, client_send, client_send_from,
+    client_send_from_with_handle, AuthContext, Authorizer, ClientSession, Server, ServerLimits,
+    SinkResolver, SourceResolver,
 };

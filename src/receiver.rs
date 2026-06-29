@@ -1,5 +1,5 @@
 //! Receiving data plane. The per-packet ingest path (parallel across cores)
-//! does only order-independent work — integrity check, atomic bitmap set, RTT
+//! does only order-independent work - integrity check, atomic bitmap set, RTT
 //! tick, and staging. All loss detection and NACK scheduling lives in the
 //! single feedback thread, which scans the bitmap on a real-time RTO basis,
 //! making loss detection immune to in-flight reordering. A single in-order
@@ -10,14 +10,15 @@ use crate::crypto::AeadBox;
 use crate::io::BlockSink;
 use crate::losstracker::{LossScanner, RecvBitmap};
 use crate::protocol::*;
-use crate::rate::{RateConfig, RateController, RttEstimator};
+use crate::rate::{RateConfig, RateController, RateWarmStart, RttEstimator};
+use crate::runtime::TransferControl;
 use crate::stats::Stats;
 use crate::sys::{self, BatchReceiver};
 use crate::util::num_cpu;
 use crossbeam_channel::{bounded, Receiver, Sender as ChanSender};
 use std::collections::HashMap;
 use std::io;
-use std::net::{SocketAddr, UdpSocket};
+use std::net::{IpAddr, SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -29,6 +30,7 @@ pub struct RecvConfig {
     pub block_size: usize,
     pub total_blocks: u64,
     pub session: u32,
+    pub expected_peer_ip: Option<IpAddr>,
     pub read_workers: usize,
     pub rate: RateConfig,
     pub crypto: Option<Arc<AeadBox>>,
@@ -36,6 +38,8 @@ pub struct RecvConfig {
     pub net_tick_interval_us: u32,
     pub max_nacks_per_pdu: usize,
     pub stats: Arc<Stats>,
+    pub control: Option<Arc<TransferControl>>,
+    pub warm_start: Option<RateWarmStart>,
     /// For client-pull only: the sender's data address. The receiver must send
     /// START here to bootstrap the flow (the sender waits for it). This goes via
     /// the platform feedback path, since the RIO data socket on Windows cannot
@@ -57,11 +61,13 @@ struct Shared {
     block_size: usize,
     total_blocks: u64,
     session: u32,
+    expected_peer_ip: Option<IpAddr>,
     crypto: Option<Arc<AeadBox>>,
     feedback_interval_us: u32,
     net_tick_interval_us: u32,
     max_nacks_per_pdu: usize,
     stats: Arc<Stats>,
+    control: Option<Arc<TransferControl>>,
     start_peer: Option<SocketAddr>,
 
     bm: Arc<RecvBitmap>,
@@ -69,6 +75,7 @@ struct Shared {
     max_seen: AtomicU64,
     seen_any: AtomicBool,
     all_sent: AtomicBool,
+    flushed_blocks: AtomicU64,
     done: AtomicBool,
 
     peer: Mutex<Option<SocketAddr>>,
@@ -133,8 +140,33 @@ pub fn new_receiver(mut cfg: RecvConfig) -> Receiver_ {
         .total_blocks
         .store(cfg.total_blocks, Ordering::Relaxed);
     cfg.stats
+        .block_size
+        .store(cfg.block_size as u64, Ordering::Relaxed);
+    cfg.stats
         .target_rate_bps
         .store(cfg.rate.target_bps, Ordering::Relaxed);
+
+    let path_rtt = RttEstimator::new();
+    let mut net_rtt = RttEstimator::new();
+    let mut rate = RateController::new(cfg.rate);
+    if let Some(warm) = cfg.warm_start {
+        rate.set_rate(warm.rate_bps);
+        net_rtt.seed(warm.srtt_net_us, warm.base_rtt_us);
+        if warm.rate_bps > 0 {
+            let rate_bps = if cfg.rate.max_bps == 0 {
+                warm.rate_bps
+            } else {
+                warm.rate_bps.min(cfg.rate.max_bps)
+            };
+            cfg.stats.target_rate_bps.store(rate_bps, Ordering::Relaxed);
+        }
+        cfg.stats
+            .srtt_net_us
+            .store(warm.srtt_net_us, Ordering::Relaxed);
+        cfg.stats
+            .base_rtt_us
+            .store(warm.base_rtt_us, Ordering::Relaxed);
+    }
 
     let sh = Arc::new(Shared {
         sock: cfg.sock,
@@ -143,23 +175,26 @@ pub fn new_receiver(mut cfg: RecvConfig) -> Receiver_ {
         block_size: cfg.block_size,
         total_blocks: cfg.total_blocks,
         session: cfg.session,
+        expected_peer_ip: cfg.expected_peer_ip,
         crypto: cfg.crypto,
         feedback_interval_us: cfg.feedback_interval_us,
         net_tick_interval_us: cfg.net_tick_interval_us,
         max_nacks_per_pdu: cfg.max_nacks_per_pdu,
         stats: cfg.stats,
+        control: cfg.control,
         start_peer: cfg.start_peer,
         bm: Arc::new(RecvBitmap::new(cfg.total_blocks)),
         ready_bm: Arc::new(RecvBitmap::new(cfg.total_blocks)),
         max_seen: AtomicU64::new(0),
         seen_any: AtomicBool::new(false),
         all_sent: AtomicBool::new(false),
+        flushed_blocks: AtomicU64::new(0),
         done: AtomicBool::new(false),
         peer: Mutex::new(None),
         rtt: Mutex::new(RttState {
-            path: RttEstimator::new(),
-            net: RttEstimator::new(),
-            rate: RateController::new(cfg.rate),
+            path: path_rtt,
+            net: net_rtt,
+            rate,
         }),
         stage: Mutex::new(HashMap::with_capacity(depth)),
         free_tx,
@@ -191,7 +226,7 @@ impl Receiver_ {
         let fb = engine.feedback_sender(&sh.sock);
 
         // Client-pull bootstrap: the sender waits for a START before injecting
-        // any DATA. Send it via the feedback path (RIOSendEx on Windows) — the
+        // any DATA. Send it via the feedback path (RIOSendEx on Windows) - the
         // RIO data socket cannot use the standard `send_to`. Keep nudging until
         // the first DATA arrives, in case the START is lost on the wire.
         if let Some(peer) = sh.start_peer {
@@ -206,7 +241,7 @@ impl Receiver_ {
             handles.push(std::thread::spawn(move || {
                 for _ in 0..25 {
                     std::thread::sleep(Duration::from_millis(200));
-                    if stop.load(Ordering::Relaxed)
+                    if should_stop(&stop, sh.control.as_ref())
                         || sh.stats.packets_recv.load(Ordering::Relaxed) > 0
                     {
                         return;
@@ -243,7 +278,7 @@ impl Receiver_ {
         }
 
         // Wait for completion / stop.
-        while !sh.done.load(Ordering::Relaxed) && !stop.load(Ordering::Relaxed) {
+        while !sh.done.load(Ordering::Relaxed) && !should_stop(stop, sh.control.as_ref()) {
             std::thread::sleep(Duration::from_millis(5));
         }
 
@@ -306,6 +341,7 @@ fn flusher_loop(sh: &Shared, stop: &Arc<AtomicBool>) {
                 let _ = sh.free_tx.send(buf);
             }
             write_front += 1;
+            sh.flushed_blocks.store(write_front, Ordering::Release);
             progressed = true;
         }
         if write_front >= total {
@@ -315,7 +351,7 @@ fn flusher_loop(sh: &Shared, stop: &Arc<AtomicBool>) {
             continue;
         }
         // Frontier blocked on a not-yet-received hole; wait for arrivals.
-        if stop.load(Ordering::Relaxed) {
+        if should_stop(stop, sh.control.as_ref()) {
             return;
         }
         let _ = sh.flush_rx.recv_timeout(Duration::from_millis(2));
@@ -331,7 +367,7 @@ fn writeback_loop(sh: &Shared, stop: &Arc<AtomicBool>) {
     let bs = sh.block_size as i64;
     let mut prefix: i64 = 0;
     loop {
-        if stop.load(Ordering::Relaxed) || sh.done.load(Ordering::Relaxed) {
+        if should_stop(stop, sh.control.as_ref()) || sh.done.load(Ordering::Relaxed) {
             return;
         }
         std::thread::sleep(Duration::from_millis(50));
@@ -354,13 +390,13 @@ fn writeback_loop(sh: &Shared, stop: &Arc<AtomicBool>) {
 /// Windows).
 fn ingest_loop(sh: &Shared, stop: &Arc<AtomicBool>, mut br: BatchReceiver) {
     loop {
-        if stop.load(Ordering::Relaxed) || sh.done.load(Ordering::Relaxed) {
+        if should_stop(stop, sh.control.as_ref()) || sh.done.load(Ordering::Relaxed) {
             return;
         }
         let n = match br.recv(&sh.sock) {
             Ok(n) => n,
             Err(e) if sys::is_timeout(&e) => {
-                if sh.done.load(Ordering::Relaxed) || stop.load(Ordering::Relaxed) {
+                if sh.done.load(Ordering::Relaxed) || should_stop(stop, sh.control.as_ref()) {
                     return;
                 }
                 continue;
@@ -375,29 +411,42 @@ fn ingest_loop(sh: &Shared, stop: &Arc<AtomicBool>, mut br: BatchReceiver) {
             if data.is_empty() {
                 continue;
             }
-            learn_peer(sh, addr);
             sh.stats.packets_recv.fetch_add(1, Ordering::Relaxed);
             sh.stats
                 .bytes_recv
                 .fetch_add(data.len() as u64, Ordering::Relaxed);
-            handle_packet(sh, data);
+            handle_packet(sh, data, addr);
         }
     }
 }
 
-fn learn_peer(sh: &Shared, addr: Option<SocketAddr>) {
-    if let Some(a) = addr {
-        let mut p = sh.peer.lock().unwrap();
-        if p.is_none() {
+fn learn_peer(sh: &Shared, addr: Option<SocketAddr>) -> bool {
+    let Some(a) = addr else {
+        return sh.peer.lock().unwrap().is_some();
+    };
+    if sh.expected_peer_ip.is_some_and(|ip| a.ip() != ip) {
+        return false;
+    }
+    let mut p = sh.peer.lock().unwrap();
+    match *p {
+        Some(existing) => existing == a,
+        None => {
             *p = Some(a);
+            true
         }
     }
 }
 
-fn handle_packet(sh: &Shared, pkt: &mut [u8]) {
+fn handle_packet(sh: &Shared, pkt: &mut [u8], addr: Option<SocketAddr>) {
     match pdu_type(pkt) {
         PDU_FIN => {
-            if pkt.len() >= 16 {
+            if let Some((session, total_blocks)) = decode_fin(pkt) {
+                if session != sh.session || total_blocks != sh.total_blocks {
+                    return;
+                }
+                if !learn_peer(sh, addr) {
+                    return;
+                }
                 sh.all_sent.store(true, Ordering::Relaxed);
             }
             return;
@@ -412,8 +461,17 @@ fn handle_packet(sh: &Shared, pkt: &mut [u8]) {
     if h.session != sh.session {
         return;
     }
-
+    if h.block_seq >= sh.total_blocks {
+        return;
+    }
     let plen = h.payload_len as usize;
+    if plen > sh.block_size {
+        return;
+    }
+    if addr.is_some_and(|a| sh.expected_peer_ip.is_some_and(|ip| a.ip() != ip)) {
+        return;
+    }
+
     let payload_start = DATA_HEADER_SIZE;
     let payload_ok_len;
     if let Some(crypto) = &sh.crypto {
@@ -435,6 +493,9 @@ fn handle_packet(sh: &Shared, pkt: &mut [u8]) {
             return;
         }
         payload_ok_len = plen;
+    }
+    if !learn_peer(sh, addr) {
+        return;
     }
 
     if h.flags & FLAG_HAS_TICK != 0 {
@@ -524,7 +585,7 @@ fn feedback_loop(sh: &Shared, stop: &Arc<AtomicBool>, fb: sys::FeedbackSender) {
     let mut next = Instant::now() + interval;
 
     loop {
-        if stop.load(Ordering::Relaxed) {
+        if should_stop(stop, sh.control.as_ref()) {
             return;
         }
         let now_i = Instant::now();
@@ -548,6 +609,7 @@ fn feedback_loop(sh: &Shared, stop: &Arc<AtomicBool>, fb: sys::FeedbackSender) {
             let target = rtt.rate.update(srtt_net, base_net);
             (path_rto, srtt_net, base_net, target)
         };
+        let target = effective_rate(sh.control.as_ref(), target);
         let _ = (srtt_net, base_net);
         sh.stats.target_rate_bps.store(target, Ordering::Relaxed);
 
@@ -574,7 +636,8 @@ fn feedback_loop(sh: &Shared, stop: &Arc<AtomicBool>, fb: sys::FeedbackSender) {
         if sh.seen_any.load(Ordering::Relaxed) || sh.all_sent.load(Ordering::Relaxed) {
             scanner.scan_holes(ms, now, path_rto);
         }
-        let complete = scanner.completed();
+        let complete = sh.all_sent.load(Ordering::Acquire)
+            && sh.flushed_blocks.load(Ordering::Acquire) == sh.total_blocks;
         sh.stats.hi_contig.store(hi, Ordering::Relaxed);
         sh.stats
             .rex_queue_len
@@ -639,4 +702,12 @@ fn feedback_loop(sh: &Shared, stop: &Arc<AtomicBool>, fb: sys::FeedbackSender) {
             }
         }
     }
+}
+
+fn should_stop(stop: &Arc<AtomicBool>, control: Option<&Arc<TransferControl>>) -> bool {
+    stop.load(Ordering::Relaxed) || control.is_some_and(|c| c.is_cancelled())
+}
+
+fn effective_rate(control: Option<&Arc<TransferControl>>, rate: u64) -> u64 {
+    control.map_or(rate, |c| c.effective_rate_bps(rate))
 }

@@ -245,6 +245,14 @@ pub fn encode_start(buf: &mut [u8], session: u32) -> usize {
     8
 }
 
+/// Decodes a START PDU, returning its session id.
+pub fn decode_start(buf: &[u8]) -> Option<u32> {
+    if buf.len() < 8 || buf[0] != PDU_START {
+        return None;
+    }
+    Some(get_u32(&buf[4..8]))
+}
+
 /// FIN (sender->receiver, "I have injected every new block at least once").
 pub fn encode_fin(buf: &mut [u8], session: u32, total_blocks: u64) -> usize {
     buf[0] = PDU_FIN;
@@ -254,6 +262,14 @@ pub fn encode_fin(buf: &mut [u8], session: u32, total_blocks: u64) -> usize {
     put_u32(&mut buf[4..8], session);
     put_u64(&mut buf[8..16], total_blocks);
     16
+}
+
+/// Decodes a FIN PDU, returning `(session, total_blocks)`.
+pub fn decode_fin(buf: &[u8]) -> Option<(u32, u64)> {
+    if buf.len() < 16 || buf[0] != PDU_FIN {
+        return None;
+    }
+    Some((get_u32(&buf[4..8]), get_u64(&buf[8..16])))
 }
 
 /// Returns the type byte (0 if empty).

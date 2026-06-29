@@ -60,6 +60,20 @@ impl RttEstimator {
     pub fn rto(&self) -> f64 {
         (self.srtt + RTT_RTO_K * self.vrtt).clamp(self.min_rto, self.max_rto)
     }
+
+    pub fn seed(&mut self, srtt_us: u64, min_rtt_us: u64) {
+        if srtt_us == 0 {
+            return;
+        }
+        self.srtt = srtt_us as f64;
+        self.vrtt = (srtt_us as f64 / 4.0).max(1.0);
+        self.min_rtt = if min_rtt_us == 0 {
+            srtt_us as f64
+        } else {
+            min_rtt_us.min(srtt_us) as f64
+        };
+        self.have_any = true;
+    }
 }
 
 impl Default for RttEstimator {
@@ -90,6 +104,19 @@ pub struct RateConfig {
     /// Adaptation factor `a` (bits/sec) from patent Eq.2; sets the equilibrium
     /// operating point rate ~= alpha / (1 - base/srtt). Adaptive mode only.
     pub alpha: f64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RateWarmStart {
+    pub rate_bps: u64,
+    pub srtt_net_us: u64,
+    pub base_rtt_us: u64,
+}
+
+impl RateWarmStart {
+    pub fn is_empty(self) -> bool {
+        self.rate_bps == 0 && self.srtt_net_us == 0 && self.base_rtt_us == 0
+    }
 }
 
 /// Computes the target injection rate. In adaptive mode it applies patent Eq.2:
@@ -143,5 +170,12 @@ impl RateController {
             .rate
             .clamp(self.cfg.min_bps as f64, self.cfg.max_bps as f64);
         self.rate as u64
+    }
+
+    pub fn set_rate(&mut self, rate_bps: u64) {
+        if rate_bps == 0 {
+            return;
+        }
+        self.rate = (rate_bps as f64).clamp(self.cfg.min_bps as f64, self.cfg.max_bps as f64);
     }
 }

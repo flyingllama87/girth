@@ -61,6 +61,21 @@ fn feedback_round_trip() {
 }
 
 #[test]
+fn start_and_fin_round_trip_with_session() {
+    let mut start = [0u8; 8];
+    let n = encode_start(&mut start, 0x1122_3344);
+    assert_eq!(n, 8);
+    assert_eq!(decode_start(&start), Some(0x1122_3344));
+    assert_eq!(decode_start(&start[..7]), None);
+
+    let mut fin = [0u8; 16];
+    let n = encode_fin(&mut fin, 0x5566_7788, 12345);
+    assert_eq!(n, 16);
+    assert_eq!(decode_fin(&fin), Some((0x5566_7788, 12345)));
+    assert_eq!(decode_fin(&fin[..15]), None);
+}
+
+#[test]
 fn crc32c_detects_corruption() {
     let mut data = b"the quick brown fox".to_vec();
     let c = crc32c(&data);
@@ -80,6 +95,20 @@ fn rtt_estimator_converges_and_bounds() {
     assert!(rto >= e.srtt);
     e.sample(100000.0);
     assert_eq!(e.min_rtt, 100000.0);
+}
+
+#[test]
+fn rtt_estimator_can_be_seeded() {
+    let mut e = RttEstimator::new();
+    e.seed(120_000, 90_000);
+
+    assert_eq!(e.srtt, 120_000.0);
+    assert_eq!(e.min_rtt, 90_000.0);
+    assert!(e.rto() >= e.srtt);
+
+    e.sample(100_000.0);
+    assert!(e.srtt < 120_000.0);
+    assert_eq!(e.min_rtt, 90_000.0);
 }
 
 #[test]
@@ -105,6 +134,21 @@ fn adaptive_rate_equilibrium() {
         rate,
         want
     );
+}
+
+#[test]
+fn adaptive_rate_can_be_warm_started() {
+    let cfg = RateConfig {
+        mode: RateMode::Adaptive,
+        target_bps: 1_000_000,
+        max_bps: 10_000_000,
+        min_bps: 1000,
+        alpha: 30_000_000.0,
+    };
+    let mut rc = RateController::new(cfg);
+    rc.set_rate(50_000_000);
+
+    assert_eq!(rc.update(0.0, 0.0), 10_000_000);
 }
 
 #[test]
@@ -179,7 +223,7 @@ fn num_blocks_cases() {
     }
 }
 
-// --- decoder negative tests (no panics on malformed/short input) -------------
+// --- decoder negative tests (P0-2: no panics on malformed/short input) -------
 
 #[test]
 fn decoders_reject_malformed_without_panicking() {

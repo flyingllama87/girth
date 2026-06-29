@@ -145,8 +145,8 @@ impl BlockSink for FileSink {
     fn allocate(&self, len: u64) -> io::Result<()> {
         self.len.store(len, Ordering::Relaxed);
         let size = len as i64;
-        if size > 0 && crate::sys::fallocate(&self.file, size).is_ok() {
-            return Ok(());
+        if size > 0 {
+            let _ = crate::sys::fallocate(&self.file, size);
         }
         self.file.set_len(len)
     }

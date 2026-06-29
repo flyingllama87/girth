@@ -11,7 +11,8 @@
 use crate::crypto::AeadBox;
 use crate::io::BlockSource;
 use crate::protocol::*;
-use crate::rate::{RateConfig, RateMode};
+use crate::rate::{RateConfig, RateMode, RateWarmStart};
+use crate::runtime::TransferControl;
 use crate::stats::Stats;
 use crate::sys::{self, BatchSender};
 use crate::util::precise_sleep_us;
@@ -19,7 +20,7 @@ use crossbeam_channel::{bounded, Receiver, Sender as ChanSender, TryRecvError};
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashSet};
 use std::io;
-use std::net::{SocketAddr, UdpSocket};
+use std::net::{IpAddr, SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -30,6 +31,8 @@ pub struct SendConfig {
     pub sock: Arc<UdpSocket>,
     /// Receiver UDP addr; `None` => learned from the first packet (START).
     pub peer: Option<SocketAddr>,
+    /// Optional control-peer IP expected for learned START / feedback traffic.
+    pub expected_peer_ip: Option<IpAddr>,
     pub source: Arc<dyn BlockSource>,
     pub file_size: i64,
     pub block_size: usize,
@@ -39,6 +42,8 @@ pub struct SendConfig {
     pub read_workers: usize,
     pub crypto: Option<Arc<AeadBox>>,
     pub stats: Arc<Stats>,
+    pub control: Option<Arc<TransferControl>>,
+    pub warm_start: Option<RateWarmStart>,
 }
 
 #[derive(Default)]
@@ -68,7 +73,9 @@ struct Shared {
 
     peer: SocketAddr,
     target_bps: AtomicU64,
+    configured_target_bps: u64,
     done: AtomicBool,
+    control: Option<Arc<TransferControl>>,
 
     rex: Mutex<RexQueue>,
     tick: Mutex<TickState>,
@@ -93,12 +100,28 @@ impl Sender {
         } else {
             cfg.rate.target_bps
         };
+        let init = if cfg.rate.mode == RateMode::Adaptive {
+            let max_bps = if cfg.rate.max_bps == 0 {
+                u64::MAX
+            } else {
+                cfg.rate.max_bps
+            };
+            cfg.warm_start
+                .filter(|w| w.rate_bps > 0)
+                .map(|w| w.rate_bps.min(max_bps))
+                .unwrap_or(init)
+        } else {
+            init
+        };
         cfg.stats
             .total_bytes
             .store(cfg.file_size as u64, Ordering::Relaxed);
         cfg.stats
             .total_blocks
             .store(cfg.total_blocks, Ordering::Relaxed);
+        cfg.stats
+            .block_size
+            .store(cfg.block_size as u64, Ordering::Relaxed);
         cfg.stats.target_rate_bps.store(init, Ordering::Relaxed);
         Sender { cfg }
     }
@@ -113,7 +136,13 @@ impl Sender {
         // receiver sends START first).
         let peer = match self.cfg.peer {
             Some(p) => p,
-            None => wait_for_peer(&self.cfg.sock, stop)?,
+            None => wait_for_peer(
+                &self.cfg.sock,
+                self.cfg.session,
+                self.cfg.expected_peer_ip,
+                self.cfg.control.as_ref(),
+                stop,
+            )?,
         };
 
         let init = self.cfg.stats.target_rate_bps.load(Ordering::Relaxed);
@@ -129,7 +158,9 @@ impl Sender {
             stats: self.cfg.stats.clone(),
             peer,
             target_bps: AtomicU64::new(init),
+            configured_target_bps: init,
             done: AtomicBool::new(false),
+            control: self.cfg.control.clone(),
             rex: Mutex::new(RexQueue::default()),
             tick: Mutex::new(TickState::default()),
         });
@@ -177,18 +208,31 @@ impl Sender {
     }
 }
 
-fn wait_for_peer(sock: &UdpSocket, stop: &Arc<AtomicBool>) -> io::Result<SocketAddr> {
+fn wait_for_peer(
+    sock: &UdpSocket,
+    session: u32,
+    expected_ip: Option<IpAddr>,
+    control: Option<&Arc<TransferControl>>,
+    stop: &Arc<AtomicBool>,
+) -> io::Result<SocketAddr> {
     let mut buf = [0u8; 2048];
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
     loop {
-        if stop.load(Ordering::Relaxed) {
+        if should_stop(stop, control) {
             return Err(io::Error::other("stopped while waiting for receiver"));
         }
         if std::time::Instant::now() >= deadline {
             return Err(io::Error::other("timed out waiting for receiver START"));
         }
         match sock.recv_from(&mut buf) {
-            Ok((_, addr)) => return Ok(addr),
+            Ok((n, addr)) => {
+                if expected_ip.is_some_and(|ip| addr.ip() != ip) {
+                    continue;
+                }
+                if decode_start(&buf[..n]) == Some(session) {
+                    return Ok(addr);
+                }
+            }
             Err(e) if sys::is_timeout(&e) => continue,
             Err(e) => return Err(e),
         }
@@ -208,7 +252,7 @@ fn prefetch(
     for seq in lo..hi {
         // Borrow a pooled buffer.
         let mut buf = loop {
-            if stop.load(Ordering::Relaxed) || sh.done.load(Ordering::Relaxed) {
+            if should_stop(stop, sh.control.as_ref()) || sh.done.load(Ordering::Relaxed) {
                 return;
             }
             match free_rx.recv_timeout(Duration::from_millis(100)) {
@@ -319,11 +363,17 @@ fn pacing_loop(
         if sh.done.load(Ordering::Relaxed) {
             return Ok(());
         }
-        if stop.load(Ordering::Relaxed) {
+        if should_stop(stop, sh.control.as_ref()) {
             return Err(io::Error::other("sender stopped"));
         }
+        if is_paused(sh.control.as_ref()) {
+            next_deadline = now_micros() as f64;
+            std::thread::sleep(Duration::from_millis(20));
+            continue;
+        }
 
-        let r = sh.target_bps.load(Ordering::Relaxed);
+        let r = effective_rate(sh.control.as_ref(), sh.target_bps.load(Ordering::Relaxed));
+        sh.stats.target_rate_bps.store(r, Ordering::Relaxed);
         if r != cur_rate {
             recompute(r, &mut cur_rate, &mut ipd_us, &mut batch);
         }
@@ -497,11 +547,16 @@ fn send_fin(sh: &Shared) {
 fn feedback_loop(sh: &Shared, stop: &Arc<AtomicBool>) {
     let mut buf = [0u8; 2048];
     loop {
-        if sh.done.load(Ordering::Relaxed) || stop.load(Ordering::Relaxed) {
+        if sh.done.load(Ordering::Relaxed) || should_stop(stop, sh.control.as_ref()) {
             return;
         }
         let n = match sh.sock.recv_from(&mut buf) {
-            Ok((n, _)) => n,
+            Ok((n, addr)) => {
+                if addr != sh.peer {
+                    continue;
+                }
+                n
+            }
             Err(e) if sys::is_timeout(&e) => continue,
             Err(_) => return,
         };
@@ -531,11 +586,15 @@ fn feedback_loop(sh: &Shared, stop: &Arc<AtomicBool>) {
             push_retransmits(sh, &nacks);
         }
 
-        if sh.rate_mode == RateMode::Adaptive && fh.target_rate > 0 {
-            sh.target_bps.store(fh.target_rate, Ordering::Relaxed);
-            sh.stats
-                .target_rate_bps
-                .store(fh.target_rate, Ordering::Relaxed);
+        if fh.target_rate > 0 {
+            let peer_target = if sh.rate_mode == RateMode::Adaptive {
+                fh.target_rate
+            } else {
+                fh.target_rate.min(sh.configured_target_bps)
+            };
+            sh.target_bps.store(peer_target, Ordering::Relaxed);
+            let effective = effective_rate(sh.control.as_ref(), peer_target);
+            sh.stats.target_rate_bps.store(effective, Ordering::Relaxed);
         }
         sh.stats.hi_contig.store(fh.hi_contig, Ordering::Relaxed);
 
@@ -572,4 +631,16 @@ fn pop_retransmit(sh: &Shared) -> Option<u64> {
 
 fn rex_len(sh: &Shared) -> usize {
     sh.rex.lock().unwrap().heap.len()
+}
+
+fn should_stop(stop: &Arc<AtomicBool>, control: Option<&Arc<TransferControl>>) -> bool {
+    stop.load(Ordering::Relaxed) || control.is_some_and(|c| c.is_cancelled())
+}
+
+fn is_paused(control: Option<&Arc<TransferControl>>) -> bool {
+    control.is_some_and(|c| c.is_paused())
+}
+
+fn effective_rate(control: Option<&Arc<TransferControl>>, rate: u64) -> u64 {
+    control.map_or(rate, |c| c.effective_rate_bps(rate))
 }

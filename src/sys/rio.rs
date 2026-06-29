@@ -536,7 +536,8 @@ impl BatchReceiver {
         // ever land, and the receiver wedges permanently (OS keeps receiving
         // datagrams it has no buffer for). `retain` keeps the ones that failed.
         let core = &self.core;
-        self.pending.retain(|&idx| core.post_recv(idx as usize).is_err());
+        self.pending
+            .retain(|&idx| core.post_recv(idx as usize).is_err());
         self.batch.clear();
 
         let dequeue = self.core.rio.RIODequeueCompletion.unwrap();
