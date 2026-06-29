@@ -12,13 +12,13 @@ The project *was* AI-assisted (Opus 4.8 High reasoning). However, the project wa
 
 - Library crate: `girth`
 - CLI binary: `girth`
-- Runtime model: blocking OS threads, no async runtime
+- Runtime model: blocking OS threads, no async runtime. This is by design due to pacer sensitivity
 - Designed to spread load over multiple cores
 - Optional data encryption: 256-bit AEAD key using X25519 + HKDF-SHA256; AES-256-GCM (if hardware supports) or ChaCha20-Poly1305 (fallback)
-- File-backed CLI plus in-memory `BlockSource` / `BlockSink` APIs
+- File-backed CLI plus in-memory `BlockSource` / `BlockSink` APIs, transfer handles, stats snapshots, persistent client sessions, and server-side source/sink resolvers
 - Linux has recvmmsg/sendmmsg batching backend 
 - Windows has a RIO (Registered Input-Output) receive/send backend
-- Original Go implementation is available on the `go` branch but is not wire compatible with the rust version, but the core transport and packet pacer is the same.
+- Original Go implementation is available on the `go` branch but is not wire compatible with the rust version, but the core transport and packet pacer is the same. It will not be further updated but it is just as fast on Linux. No RIO backend on Windows.
 
 ## Simple Example
 
@@ -31,7 +31,7 @@ cargo build --release
 On the machine that will receive or serve files:
 
 ```sh
-target/release/girth server -addr :7400 -dir /data
+target/release/girth server -addr :7400 -dir /data -allow-unauthenticated
 ```
 
 Push a file to it:
@@ -46,7 +46,15 @@ Pull a file from it:
 target/release/girth recv -rate 800 server.example:7400 bigfile.bin ./bigfile.bin
 ```
 
-Add `-encrypt` on client commands if you want encrypted DATA payloads.
+That example is an open server. For anything real, use a shared auth token:
+
+```sh
+target/release/girth server -addr :7400 -dir /data -auth test-token
+target/release/girth send -rate 800 -auth test-token ./bigfile.bin server.example:7400
+target/release/girth recv -rate 800 -auth test-token server.example:7400 bigfile.bin ./bigfile.bin
+```
+
+Add `-encrypt` on client commands if you want encrypted DATA payloads. Auth proves the client/server know the shared token; encryption protects the UDP data payloads.
 
 ## Network Requirements
 
@@ -54,7 +62,7 @@ girth uses two network paths:
 
 | Channel | Protocol | Direction | Purpose |
 |---|---|---|---|
-| Control | TCP | client to server | handshake, file metadata, negotiated UDP port, optional key exchange |
+| Control | TCP | client to server | handshake, file metadata, PSK auth, negotiated UDP port, optional key exchange |
 | Data | UDP | bidirectional | file DATA, receiver START, FEEDBACK/NACKs, FIN |
 
 The server always needs an inbound TCP control port. The default CLI port is `7400`, set with `girth server -addr :7400`.
@@ -63,7 +71,7 @@ For each transfer, the receiver binds a UDP data socket and advertises that port
 
 For library servers, use `Server::with_udp_port_range(start..=end)` to constrain the UDP data ports to a firewall-friendly range. Open inbound TCP on the control port and inbound UDP on that range.
 
-Pull mode is NAT-friendly for a receiver behind NAT/CGNAT: the receiver dials the server's TCP control port and sends the first UDP START packet out to the server, creating the NAT mapping before data starts flowing.
+Pull mode is NAT-friendly for a receiver behind NAT/CGNAT: the receiver dials the server's TCP control port and sends the first UDP START packet out to the server, creating the NAT mapping before data starts flowing. Current direct mode also hardens the data path by requiring the learned UDP peer IP to match the TCP control peer IP. That is fine for normal direct-IP hosts, but split TCP/UDP paths, odd NAT/load-balancer setups, or a future brokered holepunch mode may need an explicit policy knob.
 
 ## Build And Test
 
@@ -84,6 +92,8 @@ Common flags:
 | `-max <Mbps>` | adaptive-mode ceiling |
 | `-adaptive` | enable delay-based adaptive rate control |
 | `-encrypt` | encrypt DATA payloads |
+| `-auth <token>` | PSK auth token; server requires it, clients prove it |
+| `-allow-unauthenticated` | server only: explicitly run as an open server |
 | `-block <bytes>` | UDP payload size, default 1400 |
 | `-workers <n>` | receiver ingest workers, 0 means auto |
 | `-fb <us>` | feedback/NACK interval |
@@ -93,7 +103,7 @@ For LFN transfers, fixed `-rate` is usually the right first choice. Adaptive mod
 
 ## Library Use
 
-File-backed transfer:
+File-backed transfer against an open server:
 
 ```rust
 use girth::{client_recv, client_send, default_params};
@@ -108,6 +118,26 @@ params.encrypt = true;
 
 client_send("server.example:7400", "bigfile.bin", &params, stop.clone())?;
 client_recv("server.example:7400", "bigfile.bin", "./out.bin", &params, stop)?;
+
+# Ok::<(), girth::GirthError>(())
+```
+
+For an auth-required server, use the source/sink APIs so the token can be passed in:
+
+```rust
+use girth::{client_recv_into, client_send_from, default_params, FileSink, FileSource};
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
+
+let stop = Arc::new(AtomicBool::new(false));
+let params = default_params();
+let token = b"test-token";
+
+let source = Arc::new(FileSource::open("bigfile.bin")?);
+client_send_from("server.example:7400", source, "bigfile.bin", &params, None, Some(token), stop.clone())?;
+
+let sink = Arc::new(FileSink::create("./out.bin")?);
+client_recv_into("server.example:7400", "bigfile.bin", sink, &params, None, Some(token), stop)?;
 
 # Ok::<(), girth::GirthError>(())
 ```
@@ -136,6 +166,8 @@ client_send_from(
 
 # Ok::<(), girth::GirthError>(())
 ```
+
+For application integration, the useful pieces are `StatsSnapshot` for progress, `TransferHandle` for lifecycle/cancel/pause/resume/live rate limits, `ClientSession` for persistent control connections and adaptive warm-start across batches, `Server::with_authorizer` for auth, `Server::with_udp_port_range` for firewall-friendly UDP ports, and `SourceResolver` / `SinkResolver` for serving or receiving objects without staging through disk.
 
 As a Git dependency:
 
